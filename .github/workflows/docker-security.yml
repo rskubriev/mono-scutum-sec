@@ -1,0 +1,164 @@
+name: Docker Security Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context.
+        required: false
+        default: .
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile relative to the caller repository.
+        required: false
+        default: Dockerfile
+        type: string
+      image-name:
+        description: Fully qualified image name, for example ghcr.io/owner/image.
+        required: false
+        default: ''
+        type: string
+      push:
+        description: Push the scanned image to the registry.
+        required: false
+        default: false
+        type: boolean
+      sign:
+        description: Sign a pushed image with Cosign keyless signing.
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Docker sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+
+      - name: Lint Dockerfile
+        run: |
+          docker run --rm \
+            -v "${PWD}:/work:ro" \
+            -w /work \
+            hadolint/hadolint@sha256:27086352fd5e1907ea2b934eb1023f217c5ae087992eb59fde121dce9c9ff21e \
+            hadolint --failure-threshold error "${{ inputs.dockerfile }}"
+
+      - name: Scan source for secrets
+        run: |
+          docker run --rm \
+            -v "${PWD}:/work:ro" \
+            -w /work \
+            aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            fs --scanners secret --exit-code 1 .
+
+  build:
+    name: Build and scan image
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.0
+
+      - name: Validate publish options
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          PUSH_IMAGE: ${{ inputs.push }}
+        run: |
+          if [ "${PUSH_IMAGE}" = "true" ] && [ -z "${IMAGE_NAME}" ]; then
+            echo "image-name is required when push is true" >&2
+            exit 1
+          fi
+
+      - name: Prepare image reference
+        id: image
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          if [ -n "${IMAGE_NAME}" ]; then
+            image_ref="${IMAGE_NAME}:${GITHUB_SHA}"
+          else
+            image_ref="local/docker-security:${GITHUB_SHA}"
+          fi
+          echo "ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build image
+        run: |
+          docker build \
+            --file "${{ inputs.dockerfile }}" \
+            --tag "${{ steps.image.outputs.ref }}" \
+            "${{ inputs.context }}"
+
+      - name: Scan image vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy@sha256:cffe3f5161a47a6823fbd23d985795b3ed72a4c806da4c4df16266c02accdd6f \
+            image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 \
+            "${{ steps.image.outputs.ref }}"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${PWD}:/work" \
+            -w /work \
+            anchore/syft@sha256:b4f1df79f97b817682d8b5ff941eb6bfe74f6172553a5e312c75bbc2eabc405c \
+            "${{ steps.image.outputs.ref }}" \
+            -o cyclonedx-json=/work/sbom.cdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.push
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          echo "${GHCR_TOKEN}" | docker login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Push image
+        if: inputs.push
+        run: docker push "${{ steps.image.outputs.ref }}"
+
+      - name: Attach SBOM to image
+        if: inputs.push
+        env:
+          COSIGN_YES: 'true'
+        run: |
+          docker run --rm \
+            -v "${PWD}:/work:ro" \
+            -v "${HOME}/.docker:/tmp/.docker:ro" \
+            -w /work \
+            -e DOCKER_CONFIG=/tmp/.docker \
+            -e COSIGN_YES \
+            ghcr.io/sigstore/cosign/cosign@sha256:d91bc4e7e95e8d2f549c747a72dc174f90579e410a1695f57f686674f84ce849 \
+            attach sbom --sbom sbom.cdx.json "${{ steps.image.outputs.ref }}"
+
+      - name: Sign image with Cosign keyless signing
+        if: inputs.push && inputs.sign
+        env:
+          COSIGN_YES: 'true'
+        run: |
+          docker run --rm \
+            -v "${HOME}/.docker:/tmp/.docker:ro" \
+            -e DOCKER_CONFIG=/tmp/.docker \
+            -e ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -e ACTIONS_ID_TOKEN_REQUEST_URL \
+            -e COSIGN_YES \
+            ghcr.io/sigstore/cosign/cosign@sha256:d91bc4e7e95e8d2f549c747a72dc174f90579e410a1695f57f686674f84ce849 \
+            sign --yes "${{ steps.image.outputs.ref }}"

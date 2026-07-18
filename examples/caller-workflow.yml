@@ -1,0 +1,20 @@
+name: Container security
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  security:
+    uses: rskubriev/mono-scutum-sec/.github/workflows/docker-security.yml@main
+    with:
+      image-name: ghcr.io/rskubriev/example-image
+      push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      sign: true
