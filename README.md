@@ -1,5 +1,7 @@
 # Scutum Security Workflow
 
+[Русская версия](README.ru.md)
+
 Reusable GitHub Actions workflow for building Docker images without shipping common configuration, secret, vulnerability, or provenance failures. It runs Hadolint and Trivy before an image is published, creates a CycloneDX SBOM with Syft, and can attach the SBOM and sign the image through Cosign keyless signing.
 
 ## Use it
